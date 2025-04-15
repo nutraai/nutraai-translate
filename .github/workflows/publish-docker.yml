@@ -1,4 +1,4 @@
-name: Build, Push and Deploy LibreTranslate
+name: Build, Publish and Deploy Docker Image
 
 on:
   push:
@@ -8,12 +8,10 @@ on:
       - v*
 
 jobs:
-  build-and-push:
-    name: Build and Push Docker Image
+  main:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Repository 
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Set up QEMU
@@ -31,44 +29,76 @@ jobs:
       - name: Get Variables
         id: get-variables
         run: |
-          echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
-          echo "GH_USERNAME_LOWER=$(echo ${{ github.repository_owner }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          echo ::set-output name=version::${GITHUB_REF#refs/tags/}
+          echo ::set-output name=gh-username-lower::$(echo ${{ github.repository_owner }} | tr '[:upper:]' '[:lower:]')
 
-      - name: Build and Push Image
+      - name: Build and push Image
         uses: docker/build-push-action@v5
         with:
           file: ./docker/Dockerfile
           platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.get-variables.outputs.gh-username-lower }}/libretranslate:${{ env.TAG }}
           push: true
-          tags: ${{ env.GH_USERNAME_LOWER }}/libretranslate:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+        env:
+          TAG: ${{ startsWith(github.ref, 'refs/tags/') && steps.get-variables.outputs.version || 'latest' }}
+
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Build and push Cuda Image
+        uses: docker/build-push-action@v5
+        with:
+          file: ./docker/cuda.Dockerfile
+          platforms: linux/amd64
+          tags: ${{ steps.get-variables.outputs.gh-username-lower }}/libretranslate:${{ env.TAG }}-cuda
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+        env:
+          TAG: ${{ startsWith(github.ref, 'refs/tags/') && steps.get-variables.outputs.version || 'latest' }}
 
   deploy:
-    name: Deploy to AWS
-    needs: build-and-push
+    needs: main
     runs-on: ubuntu-latest
-
     steps:
-      - name: SSH into AWS and Deploy
-        uses: appleboy/ssh-action@master
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Deploy na instância EC2 via SSH
+        uses: appleboy/ssh-action@v0.1.7
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           port: 22
           script: |
+            echo "Realizando login no Docker Hub..."
+            docker login -u ${{ secrets.DOCKERHUB_USERNAME }} -p ${{ secrets.DOCKERHUB_TOKEN }}
+
             echo "🧹 Limpando recursos antigos do Docker..."
             docker system prune -af
 
-            echo "🔄 Pulling imagem mais recente..."
+            echo "🔧 Verificando a rede 'rede'..."
+            docker network inspect rede >/dev/null 2>&1 || docker network create -d bridge rede
+            
+            echo "🔄 Pulling new image..."
             docker pull ${{ secrets.DOCKERHUB_USERNAME }}/libretranslate:latest
 
-            echo "🛑 Parando e removendo container antigo..."
+            echo "🛑 Stopping and removing old container..."
             docker stop libretranslate || true
             docker rm libretranslate || true
 
-            echo "🚀 Subindo novo container na porta 5000..."
-            docker run -d \
-              -p 5000:5000 \
-              --name libretranslate \
-              --restart unless-stopped \
-              ${{ secrets.DOCKERHUB_USERNAME }}/libretranslate:latest
+            echo "🚀 Running new container..."
+            docker run -d --name libretranslate -p 5000:5000 ${{ secrets.DOCKERHUB_USERNAME }}/libretranslate:latest
+
+            echo "Deploy concluído com sucesso."
